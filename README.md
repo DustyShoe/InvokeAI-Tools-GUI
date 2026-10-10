@@ -1,8 +1,9 @@
 # InvokeAI Tools GUI
 
 A compact CustomTkinter desktop application for InvokeAI database maintenance
-and PNG recompression. This repository contains the GUI and all four maintenance
-scripts, with no dependency on the original InvokeAI-Tools checkout.
+and PNG recompression. The application brings the maintenance scripts from
+[InvokeAI-Tools](https://github.com/DustyShoe/InvokeAI-Tools) together in a convenient
+graphical interface.
 
 ## Run
 
