@@ -37,6 +37,19 @@ Operations:
 Stop InvokeAI and back up your database and images before applying changes.
 Restore creates a database backup; conversion scripts do not add automatic backups.
 
+## Image directory layouts
+
+Restore detects each image's actual directory relative to the configured
+outputs/images folder and stores it in image_subfolder. Flat, date, type, hash
+(UUID prefix), and mixed layouts are supported without moving files or relying
+on the current image_subfolder_strategy setting. Existing records have their
+paths repaired even when metadata is already present. Dry run previews repairs.
+
+Nested images require a database schema with image_subfolder; older schemas
+remain supported for flat layouts. Duplicate filenames in different directories
+are rejected before writes, including when --limit is used. Initialize a missing
+database with InvokeAI first; this tool restores image records, not the schema.
+
 ## Safe stop
 
 Stop requests cooperative cancellation, with no forced process termination.
@@ -50,7 +63,7 @@ The progress bar shows activity rather than percentage until completion.
 ## Checks
 
 ```powershell
-python test_cancellation.py
+python -m unittest discover -v
 ```
 
 Tests use temporary databases and generated images, never live InvokeAI data.

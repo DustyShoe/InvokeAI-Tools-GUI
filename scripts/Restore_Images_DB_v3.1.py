@@ -500,6 +500,7 @@ def main() -> int:
 
     columns = get_table_columns(cursor, "images")
     has_workflow_column = "has_workflow" in columns
+    has_subfolder_column = "image_subfolder" in columns
 
     if not get_table_columns(cursor, "board_images"):
         print("Database does not contain the required board_images table.")
@@ -508,8 +509,31 @@ def main() -> int:
 
     cursor.execute("SELECT image_name, metadata FROM images")
     existing_metadata = {row[0]: row[1] for row in cursor.fetchall()}
+    existing_subfolders = {}
+    if has_subfolder_column:
+        cursor.execute("SELECT image_name, image_subfolder FROM images")
+        existing_subfolders = {row[0]: row[1] or "" for row in cursor.fetchall()}
 
     image_paths = iter_image_files(outputs_path, args.recurse)
+    # Validate the whole scan before applying --limit or making database changes.
+    names = {}
+    for path in image_paths:
+        cancellation_checkpoint(connection)
+        if not path.resolve().is_relative_to(outputs_path.resolve()):
+            print(f"Image resolves outside the selected images directory: {path}")
+            connection.close()
+            return 1
+        if path.name in names:
+            print(f"Ambiguous image name: {names[path.name]} and {path}")
+            connection.close()
+            return 1
+        names[path.name] = path
+    nested_count = sum(path.parent != outputs_path for path in image_paths)
+    print(f"Directory scan: {len(image_paths)} images, {nested_count} in subfolders.")
+    if nested_count and not has_subfolder_column:
+        print("This database has no image_subfolder column; nested images cannot be registered safely.")
+        connection.close()
+        return 1
     if args.limit > 0:
         image_paths = image_paths[: args.limit]
 
@@ -517,6 +541,7 @@ def main() -> int:
         "processed": 0,
         "inserted": 0,
         "updated": 0,
+        "paths_updated": 0,
         "skipped_has_metadata": 0,
         "skipped_no_metadata": 0,
         "errors": 0,
@@ -532,9 +557,19 @@ def main() -> int:
     for image_path in image_paths:
         cancellation_checkpoint(connection)
         image_name = image_path.name
+        relative_parent = image_path.parent.relative_to(outputs_path)
+        image_subfolder = "" if relative_parent == Path(".") else relative_parent.as_posix()
         stats["processed"] += 1
 
         try:
+            # Paths must be repaired even for records whose metadata is already present.
+            if has_subfolder_column and image_name in existing_metadata:
+                if existing_subfolders.get(image_name, "") != image_subfolder:
+                    print(f"{'[DRY] Would update' if args.dry_run else '[INFO] Updating'} image path: {image_name} -> {image_subfolder or '(flat)'}")
+                    if not args.dry_run:
+                        cursor.execute("UPDATE images SET image_subfolder = ? WHERE image_name = ?",
+                                       (image_subfolder, image_name))
+                    stats["paths_updated"] += 1
             metadata_value = existing_metadata.get(image_name)
             if metadata_value is not None and not is_metadata_missing(metadata_value):
                 stats["skipped_has_metadata"] += 1
@@ -589,6 +624,9 @@ def main() -> int:
                     created_at_str,
                     created_at_str,
                 ]
+                if has_subfolder_column:
+                    columns.append("image_subfolder")
+                    values.append(image_subfolder)
                 if has_workflow_column:
                     columns.append("has_workflow")
                     values.append(bool(has_workflow))
@@ -628,6 +666,7 @@ def main() -> int:
     print(f"  Processed            : {stats['processed']}")
     print(f"  Inserted             : {stats['inserted']}")
     print(f"  Metadata updated     : {stats['updated']}")
+    print(f"  Image paths updated  : {stats['paths_updated']}")
     print(f"  Skipped (already in DB with metadata): {stats['skipped_has_metadata']}")
     print(f"  Skipped (already in DB; no metadata found in file): {stats['skipped_no_metadata']}")
     print(f"  Errors               : {stats['errors']}")
@@ -636,7 +675,7 @@ def main() -> int:
     for board_name in created_boards:
         print(f"  Created board         : {board_name}")
 
-    return 0
+    return 0 if stats["errors"] == 0 else 2
 
 
 if __name__ == "__main__":
