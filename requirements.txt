@@ -1,0 +1,3 @@
+CustomTkinter>=6.0,<7
+Pillow>=10
+PyYAML>=6
