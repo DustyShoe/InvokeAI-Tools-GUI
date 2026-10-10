@@ -5,6 +5,10 @@ and PNG recompression. The application brings the maintenance scripts from
 [InvokeAI-Tools](https://github.com/DustyShoe/InvokeAI-Tools) together in a convenient
 graphical interface.
 
+This repository is now the primary home for maintenance script development and
+tests. Changes to the scripts are made and tested here first. InvokeAI-Tools
+continues to provide standalone scripts; updates can be copied there when needed.
+
 ## Run
 
 Requires Python 3.10 or newer.
