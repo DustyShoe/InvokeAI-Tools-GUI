@@ -20,22 +20,24 @@ directly to the SQLite database.
 Examples (PowerShell)::
 
     # Use the paths configured in invokeai.yaml (run from the InvokeAI root).
-    python ./Restore_Images_DB_v3.0.py
+    python ./Restore_Images_DB_v3.1.py
 
     # Override both the database and output-image paths.
-    python ./Restore_Images_DB_v3.0.py --db-path "D:/InvokeAI/databases/invokeai.db" --outputs-path "E:/InvokeAI/outputs/images"
+    python ./Restore_Images_DB_v3.1.py --db-path "D:/InvokeAI/databases/invokeai.db" --outputs-path "E:/InvokeAI/outputs/images"
 
     # Preview changes without modifying the database or creating boards.
-    python ./Restore_Images_DB_v3.0.py --db-path "D:/InvokeAI/databases/invokeai.db" --outputs-path "E:/InvokeAI/outputs/images" --dry-run
+    python ./Restore_Images_DB_v3.1.py --db-path "D:/InvokeAI/databases/invokeai.db" --outputs-path "E:/InvokeAI/outputs/images" --dry-run
 
     # Scan only files directly inside outputs/images, without subdirectories.
-    python ./Restore_Images_DB_v3.0.py --no-recurse
+    python ./Restore_Images_DB_v3.1.py --no-recurse
 """
 
 import argparse
+from contextlib import closing
+import hashlib
+import tempfile
 import datetime
 import json
-import locale
 import os
 import re
 import shutil
@@ -122,8 +124,10 @@ class ConfigMapper:
     def _load_paths_from_yaml_file(self, yaml_path: Path) -> tuple[Optional[str], Optional[str]]:
         """Load an InvokeAI yaml file and get the database and outputs paths."""
         try:
-            with open(yaml_path, "rt", encoding=locale.getpreferredencoding()) as file:
-                yamlinfo = yaml.safe_load(file)
+            with open(yaml_path, "rt", encoding="utf-8-sig") as file:
+                yamlinfo = yaml.safe_load(file) or {}
+                if not isinstance(yamlinfo, dict):
+                    raise ValueError("configuration must be a mapping")
                 db_dir = yamlinfo.get("InvokeAI", {}).get("Paths", {}).get("db_dir", None)
                 outdir = yamlinfo.get("InvokeAI", {}).get("Paths", {}).get("outdir", None)
                 if outdir is None:
@@ -135,9 +139,8 @@ class ConfigMapper:
                 if outdir is None:
                     outdir = yamlinfo.get("outputs_dir", None)
                 return db_dir, outdir
-        except Exception:
-            print(f"Failed to load paths from yaml file! {yaml_path}!")
-            return None, None
+        except Exception as exc:
+            raise ValueError(f"Unable to read paths from {yaml_path}: {exc}") from exc
 
 
 class InvokeAIMetadata:
@@ -399,10 +402,16 @@ def backup_db(database_path: Path, backup_dir: Path) -> None:
         print(f"Database backup directory {backup_dir} does not exist -> creating...", end="")
         backup_dir.mkdir(parents=True, exist_ok=True)
         print("Done!")
-    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_path = backup_dir / f"backup-{timestamp}-invokeai.db"
     print(f"Making DB backup at {backup_path}...", end="")
-    shutil.copy2(database_path, backup_path)
+    try:
+        with closing(sqlite3.connect(database_path.resolve().as_uri() + "?mode=ro", uri=True)) as source:
+            with closing(sqlite3.connect(backup_path)) as target:
+                source.backup(target, pages=256, progress=lambda *args: cancellation_checkpoint())
+    except BaseException:
+        backup_path.unlink(missing_ok=True)
+        raise
     print("Done!")
 
 
@@ -449,6 +458,60 @@ def get_or_create_board(cursor: sqlite3.Cursor, board_name: str) -> Tuple[str, b
     return board_id, True
 
 
+
+def file_digest(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def copy_verified(source: Path, target: Path) -> bool:
+    """Publish a verified copy without replacing an existing destination."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".import-", suffix=".tmp", dir=target.parent)
+    os.close(descriptor)
+    temporary_path = Path(temporary)
+    try:
+        shutil.copy2(source, temporary_path)
+        if file_digest(source) != file_digest(temporary_path):
+            raise OSError(f"Copy verification failed: {source}")
+        with temporary_path.open("r+b") as stream:
+            os.fsync(stream.fileno())
+        try:
+            # A same-directory hard link publishes the whole file atomically and
+            # fails if the name already exists, instead of overwriting it.
+            os.link(temporary_path, target)
+        except FileExistsError:
+            if file_digest(target) != file_digest(temporary_path):
+                raise FileExistsError(f"Destination conflict: {target}")
+            return False
+        return True
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def import_strategy(root: Path) -> str:
+    config_file = root / "invokeai.yaml"
+    config = yaml.safe_load(config_file.read_text(encoding="utf-8-sig")) if config_file.is_file() else {}
+    config = config or {}
+    strategy = config.get("image_subfolder_strategy", "flat")
+    if strategy not in {"flat", "date", "type", "hash"}:
+        raise ValueError(f"Unsupported image_subfolder_strategy: {strategy}")
+    return strategy
+
+
+def import_subfolder(strategy: str, name: str) -> str:
+    if strategy == "date":
+        return datetime.datetime.now().strftime("%Y/%m/%d")
+    if strategy == "type":
+        return "general"  # Newly restored images use general/internal.
+    if strategy == "hash":
+        return name[:2]
+    return ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Rescan outputs and restore missing metadata in the DB.")
     parser.add_argument("--db-path", type=Path, help="Override path to invokeai.db")
@@ -462,6 +525,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Scan and report without updating the DB")
     parser.add_argument("--no-backup", action="store_true", help="Skip DB backup before updating")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of files to process (0 = no limit)")
+    parser.add_argument("--source-path", type=Path, help="Optional batch folder; external files are copied into outputs/images")
+    parser.add_argument("--board-name", help="Board for newly registered images; blank uses automatic boards")
     args = parser.parse_args()
 
     config = ConfigMapper()
@@ -488,6 +553,19 @@ def main() -> int:
         print(f"Outputs/images not found: {outputs_path}")
         return 1
 
+    outputs_path = outputs_path.resolve()
+    source_path = (args.source_path or outputs_path).expanduser().resolve()
+    if not source_path.is_dir():
+        print(f"Source directory not found: {source_path}")
+        return 1
+    external_source = not source_path.is_relative_to(outputs_path)
+    if external_source and outputs_path.is_relative_to(source_path):
+        print("Source must not contain the destination images directory.")
+        return 1
+    strategy = import_strategy(root) if external_source else "flat"
+    print(f"Using source  : {source_path}")
+    if external_source:
+        print(f"External import layout: {strategy}")
     print(f"Using database: {database_path}")
     print(f"Using outputs : {outputs_path}")
 
@@ -495,7 +573,8 @@ def main() -> int:
     if not args.dry_run and not args.no_backup:
         backup_db(database_path, backup_dir)
 
-    connection = sqlite3.connect(str(database_path))
+    connection = sqlite3.connect(database_path.resolve().as_uri() + ("?mode=ro" if args.dry_run else "?mode=rw"), uri=True)
+    connection.execute("PRAGMA foreign_keys=ON")
     cursor = connection.cursor()
 
     columns = get_table_columns(cursor, "images")
@@ -514,12 +593,12 @@ def main() -> int:
         cursor.execute("SELECT image_name, image_subfolder FROM images")
         existing_subfolders = {row[0]: row[1] or "" for row in cursor.fetchall()}
 
-    image_paths = iter_image_files(outputs_path, args.recurse)
+    image_paths = iter_image_files(source_path, args.recurse)
     # Validate the whole scan before applying --limit or making database changes.
     names = {}
     for path in image_paths:
         cancellation_checkpoint(connection)
-        if not path.resolve().is_relative_to(outputs_path.resolve()):
+        if not path.resolve().is_relative_to(source_path):
             print(f"Image resolves outside the selected images directory: {path}")
             connection.close()
             return 1
@@ -528,7 +607,11 @@ def main() -> int:
             connection.close()
             return 1
         names[path.name] = path
-    nested_count = sum(path.parent != outputs_path for path in image_paths)
+    destination_files = {}
+    if external_source:
+        for path in iter_image_files(outputs_path, True):
+            destination_files.setdefault(path.name, []).append(path)
+    nested_count = sum(path.parent != outputs_path for path in image_paths) if not external_source else (len(image_paths) if strategy != "flat" else 0)
     print(f"Directory scan: {len(image_paths)} images, {nested_count} in subfolders.")
     if nested_count and not has_subfolder_column:
         print("This database has no image_subfolder column; nested images cannot be registered safely.")
@@ -542,6 +625,8 @@ def main() -> int:
         "inserted": 0,
         "updated": 0,
         "paths_updated": 0,
+        "copied": 0,
+        "conflicts": 0,
         "skipped_has_metadata": 0,
         "skipped_no_metadata": 0,
         "errors": 0,
@@ -549,19 +634,52 @@ def main() -> int:
         "added_to_no_metadata_board": 0,
     }
     date_suffix = datetime.datetime.now().strftime("%y-%m-%d")
-    import_board_name = f"Import-{date_suffix}"
-    no_metadata_board_name = f"No metadata-{date_suffix}"
+    import_board_name = (args.board_name or "").strip() or f"Import-{date_suffix}"
+    no_metadata_board_name = (args.board_name or "").strip() or f"No metadata-{date_suffix}"
     board_ids: dict[str, str] = {}
     created_boards: list[str] = []
 
+    connection.execute("BEGIN")
     for image_path in image_paths:
         cancellation_checkpoint(connection)
         image_name = image_path.name
-        relative_parent = image_path.parent.relative_to(outputs_path)
-        image_subfolder = "" if relative_parent == Path(".") else relative_parent.as_posix()
         stats["processed"] += 1
-
+        source_image = image_path
+        stats_before = stats.copy()
+        created_before = len(created_boards)
+        cursor.execute("SAVEPOINT import_image")
         try:
+            if external_source:
+                candidates = destination_files.get(image_name, [])
+                if len(candidates) > 1 or (candidates and file_digest(candidates[0]) != file_digest(source_image)):
+                    stats["conflicts"] += 1
+                    print(f"[CONFLICT] Skipped {source_image}: destination name has different or ambiguous contents")
+                    cursor.execute("RELEASE import_image")
+                    continue
+                if candidates:
+                    if not candidates[0].resolve().is_relative_to(outputs_path):
+                        raise ValueError(f"Destination resolves outside outputs/images: {candidates[0]}")
+                    image_path = candidates[0]
+                    print(f"[INFO] Identical file already present: {image_path}")
+                else:
+                    # Reuse an existing record's location when its file is missing.
+                    folder = existing_subfolders.get(image_name, import_subfolder(strategy, image_name))
+                    image_path = outputs_path / folder / image_name
+                    if not image_path.resolve().is_relative_to(outputs_path):
+                        raise ValueError(f"Unsafe destination: {image_path}")
+                    # Verify readability before publishing a new file.
+                    with PIL.Image.open(source_image) as image:
+                        image.verify()
+                    print(f"{'[DRY] Would copy' if args.dry_run else '[INFO] Copying'} {source_image} -> {image_path}")
+                    if not args.dry_run:
+                        copy_verified(source_image, image_path)
+                    stats["copied"] += 1
+                    destination_files[image_name] = [image_path]
+                cancellation_checkpoint(connection)
+            relative_parent = image_path.parent.relative_to(outputs_path)
+            image_subfolder = "" if relative_parent == Path(".") else relative_parent.as_posix()
+            if image_subfolder and not has_subfolder_column:
+                raise ValueError("This database has no image_subfolder column; nested images cannot be registered safely.")
             # Paths must be repaired even for records whose metadata is already present.
             if has_subfolder_column and image_name in existing_metadata:
                 if existing_subfolders.get(image_name, "") != image_subfolder:
@@ -573,13 +691,15 @@ def main() -> int:
             metadata_value = existing_metadata.get(image_name)
             if metadata_value is not None and not is_metadata_missing(metadata_value):
                 stats["skipped_has_metadata"] += 1
+                cursor.execute("RELEASE import_image")
                 continue
 
-            metadata_json, has_workflow, width, height = read_image_metadata(image_path)
+            metadata_json, has_workflow, width, height = read_image_metadata(source_image)
             # Existing rows without recoverable metadata need no update. New image files
             # are still registered (with NULL metadata) and added to the import board.
             if metadata_json is None and image_name in existing_metadata:
                 stats["skipped_no_metadata"] += 1
+                cursor.execute("RELEASE import_image")
                 continue
 
             if image_name in existing_metadata:
@@ -598,7 +718,7 @@ def main() -> int:
             else:
                 stats["inserted"] += 1
                 created_at = datetime.datetime.fromtimestamp(
-                    os.path.getmtime(image_path),
+                    os.path.getmtime(source_image),
                     datetime.timezone.utc,
                 )
                 created_at_str = created_at.strftime("%Y-%m-%d %H:%M:%S")
@@ -653,9 +773,17 @@ def main() -> int:
                     stats["added_to_import_board"] += 1
                 existing_metadata[image_name] = metadata_json
 
+            cursor.execute("RELEASE import_image")
         except Exception as exc:
+            cursor.execute("ROLLBACK TO import_image")
+            cursor.execute("RELEASE import_image")
+            board_ids.clear()
+            del created_boards[created_before:]
+            copied = stats["copied"]
+            stats = stats_before
+            stats["copied"] = copied  # Completed copies survive the per-image rollback.
             stats["errors"] += 1
-            print(f"Error processing {image_path}: {exc}")
+            print(f"Error processing {source_image}: {exc}")
 
     cancellation_checkpoint(connection)
     if not args.dry_run:
@@ -667,6 +795,8 @@ def main() -> int:
     print(f"  Inserted             : {stats['inserted']}")
     print(f"  Metadata updated     : {stats['updated']}")
     print(f"  Image paths updated  : {stats['paths_updated']}")
+    print(f"  Files copied/planned : {stats['copied']}")
+    print(f"  Conflicts skipped    : {stats['conflicts']}")
     print(f"  Skipped (already in DB with metadata): {stats['skipped_has_metadata']}")
     print(f"  Skipped (already in DB; no metadata found in file): {stats['skipped_no_metadata']}")
     print(f"  Errors               : {stats['errors']}")

@@ -1,77 +1,72 @@
-# InvokeAI Tools GUI
+# InvokeAI Tools GUI v1.0
 
-A compact CustomTkinter desktop application for InvokeAI database maintenance
-and PNG recompression. The application brings the maintenance scripts from
-[InvokeAI-Tools](https://github.com/DustyShoe/InvokeAI-Tools) together in a convenient
-graphical interface.
+A desktop application for InvokeAI database maintenance and PNG recompression.
+It brings the scripts from [InvokeAI-Tools](https://github.com/DustyShoe/InvokeAI-Tools)
+together in a convenient graphical interface.
 
-This repository is now the primary home for maintenance script development and
-tests. Changes to the scripts are made and tested here first. InvokeAI-Tools
-continues to provide standalone scripts; updates can be copied there when needed.
+## Getting started
 
-## Run
+Open the application and select your InvokeAI root directory, containing
+`invokeai.yaml`. Choose an operation and review its settings. Hover over an
+operation for a detailed explanation.
 
-Requires Python 3.10 or newer.
+**Dry run** is enabled by default: it previews changes without applying them.
+The log shows progress, results, skipped files, and errors.
 
-```powershell
-uv pip install -r requirements.txt
-python app.py
-```
+Stop InvokeAI before applying changes. Keep a backup of your database and images.
+Restore and Fix Image Deletion create database backups automatically; the board
+conversion operations do not.
 
-Using an existing InvokeAI test environment:
+## Operations
 
-```powershell
-& "I:\Invoke-test\.venv\Scripts\python.exe" .\app.py
-```
+- **Restore Images Database** — register missing images and recover embedded
+  metadata. Existing records retain their board membership.
+- **Convert Board to Assets** — reclassify images on the selected board as user
+  assets, preserving their files, metadata, and board membership.
+- **Convert Assets to Board** — reclassify images on the selected board as regular
+  gallery images, keeping them on the same board.
+- **Recompress PNG** — reduce PNG file sizes using compression level 9 without
+  changing pixels. Smaller results replace the originals. The summary reports space freed in megabytes;
+  Dry run reports potential savings.
+- **Fix Image Deletion (#9504)** — repair the database issue that blocks deleting
+  images after folder migration. Already repaired databases are left unchanged.
+  Unfinished migrations or database integrity problems block the repair.
 
-Choose the InvokeAI root directory containing invokeai.yaml. Board lists are read
-from the configured SQLite database. Press Enter after typing a path manually.
-Dry run is enabled by default.
+Board conversion requires an explicit board selection.
 
-Operations:
-- Restore missing image records and metadata.
-- Convert board images to assets.
-- Convert board images to gallery images.
-- Recompress PNG files recursively in the configured outputs/images directory.
+## Import a batch
 
-Stop InvokeAI and back up your database and images before applying changes.
-Restore creates a database backup; conversion scripts do not add automatic backups.
+For Restore, **Source folder** and **Import board** are optional.
 
-## Image directory layouts
+Leave Source folder empty to scan the configured `outputs/images` directory.
+Select a folder to process a particular batch. Files already inside
+`outputs/images` stay in place. External files are copied and verified;
+originals remain untouched.
 
-Restore detects each image's actual directory relative to the configured
-outputs/images folder and stores it in image_subfolder. Flat, date, type, hash
-(UUID prefix), and mixed layouts are supported without moving files or relying
-on the current image_subfolder_strategy setting. Existing records have their
-paths repaired even when metadata is already present. Dry run previews repairs.
+Enter an Import board name to group newly registered images. An existing board
+with that name is reused. Leave it empty to use the automatic daily boards:
+`Import-date` and `No metadata-date`.
 
-Nested images require a database schema with image_subfolder; older schemas
-remain supported for flat layouts. Duplicate filenames in different directories
-are rejected before writes, including when --limit is used. Initialize a missing
-database with InvokeAI first; this tool restores image records, not the schema.
+Identical destination files are reused. Files with conflicting contents are
+skipped and reported in the log. Dry run previews copying and registration.
 
-## Safe stop
+## Folder layouts
 
-Stop requests cooperative cancellation, with no forced process termination.
-PNG processing completes the current file and its atomic replacement, then stops;
-previously completed images remain processed. Database operations roll back the
-pending transaction at a safe checkpoint. A final commit already in progress is
-allowed to complete normally. Closing is blocked while an operation runs.
+Restore supports flat, date, type, hash (UUID prefix), and mixed directory
+layouts. Existing files keep their actual location. External copies follow the
+folder layout configured in InvokeAI.
 
-The progress bar shows activity rather than percentage until completion.
+Nested files require a compatible database. If the database is lost, start
+InvokeAI first to create a new one, then use Restore to register the images.
 
-## Checks
+## Stopping an operation
 
-```powershell
-python -m unittest discover -v
-```
+**Stop** requests cancellation at a safe point. The current PNG or copy finishes
+before processing stops. Completed file changes remain on disk.
 
-Tests use temporary databases and generated images, never live InvokeAI data.
-
-## Packaging status
-
-This initial source version runs scripts from its own scripts directory using the
-current Python environment. Standalone EXE packaging is planned, not implemented.
+Pending database changes are rolled back. A final save already in progress is
+allowed to finish. Copies left after cancellation can be registered on the next
+run. Wait for the operation to finish or stop before closing the application.
 
 ## License
 

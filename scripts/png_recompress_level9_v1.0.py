@@ -65,8 +65,8 @@ def parse_args() -> argparse.Namespace:
     """Build CLI parser."""
     parser = argparse.ArgumentParser(
         description=(
-            "Recursively recompress PNG files with zlib level 9 while preserving all "
-            "non-IDAT chunks exactly as they are."
+            "Recursively recompress PNG files at level 9 with Pillow, preserving supported "
+            "metadata. The optional raw-zlib engine preserves non-IDAT chunks exactly."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -271,6 +271,10 @@ def recompress_png_pil(path: Path, zip_text_metadata: bool) -> bytes:
 def recompress_png(path: Path, original_bytes: bytes, engine: str, zip_text_metadata: bool) -> bytes:
     """Dispatch to the selected recompression engine."""
     if engine == "pil":
+        # Pillow loads multichannel 16-bit PNGs as 8-bit images. Preserve the
+        # original scanlines instead of silently reducing their precision.
+        if original_bytes.startswith(PNG_SIGNATURE) and len(original_bytes) > 24 and original_bytes[24] == 16:
+            return recompress_png_raw_zlib(original_bytes)
         return recompress_png_pil(path, zip_text_metadata=zip_text_metadata)
     if engine == "raw-zlib":
         return recompress_png_raw_zlib(original_bytes)
@@ -279,22 +283,21 @@ def recompress_png(path: Path, original_bytes: bytes, engine: str, zip_text_meta
 
 def rewrite_file(path: Path, data: bytes, original_stat: os.stat_result) -> None:
     """Atomically replace the file and preserve its timestamps and mode."""
-    with tempfile.NamedTemporaryFile(
-        mode="wb",
-        delete=False,
-        dir=path.parent,
-        prefix=f"{path.stem}.",
-        suffix=".tmp",
-    ) as temp_file:
-        temp_file.write(data)
-        temp_name = Path(temp_file.name)
-
+    temp_name = None
     try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", delete=False, dir=path.parent,
+            prefix=f"{path.stem}.", suffix=".tmp",
+        ) as temp_file:
+            temp_name = Path(temp_file.name)
+            temp_file.write(data)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
         os.chmod(temp_name, original_stat.st_mode)
         os.utime(temp_name, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
         os.replace(temp_name, path)
     finally:
-        if temp_name.exists():
+        if temp_name is not None:
             temp_name.unlink(missing_ok=True)
 
 
@@ -396,17 +399,17 @@ def main() -> int:
                 zip_text_metadata=args.zip_text_metadata,
             )
         except UnsupportedPngError as error:
-            result = ProcessResult("skipped", original_size=png_path.stat().st_size, detail=str(error))
+            result = ProcessResult("skipped", original_size=0, detail=str(error))
         except ValueError as error:
-            result = ProcessResult("errors", original_size=png_path.stat().st_size, detail=str(error))
+            result = ProcessResult("errors", original_size=0, detail=str(error))
         except zlib.error as error:
-            result = ProcessResult("errors", original_size=png_path.stat().st_size, detail=str(error))
+            result = ProcessResult("errors", original_size=0, detail=str(error))
         except OSError as error:
-            result = ProcessResult("errors", original_size=png_path.stat().st_size, detail=str(error))
+            result = ProcessResult("errors", original_size=0, detail=str(error))
 
         stats[result.status] = stats.get(result.status, 0) + 1
         if result.status in {"rewritten", "would-rewrite"} and result.new_size is not None:
-            stats["saved_bytes"] += max(result.original_size - result.new_size, 0)
+            stats["saved_bytes"] += result.original_size - result.new_size
 
         if args.verbose or result.status not in {"unchanged"}:
             print_result(png_path, result)
@@ -423,6 +426,10 @@ def main() -> int:
         f"errors={stats['errors']}, "
         f"saved_bytes={stats['saved_bytes']}"
     )
+
+    saved_mb = stats["saved_bytes"] / 1_000_000
+    label = "Potential space saving (dry run)" if args.dry_run else "Space freed"
+    print(f"{label}: {saved_mb:.2f} MB ({stats['saved_bytes']:,} bytes)")
 
     return 0 if stats["errors"] == 0 else 2
 

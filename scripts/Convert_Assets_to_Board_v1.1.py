@@ -164,15 +164,14 @@ def get_board_id_by_name(conn: sqlite3.Connection, board_name: str) -> str:
     Raises:
         SystemExit if the board cannot be found.
     """
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT board_id FROM boards WHERE LOWER(board_name) = LOWER(?)",
-        (board_name,),
-    )
-    row = cur.fetchone()
-    if not row:
-        raise SystemExit(f"Board with name '{board_name}' not found (case-insensitive).")
-    return row[0]
+    rows = conn.execute("SELECT board_id FROM boards WHERE board_name = ? COLLATE BINARY", (board_name,)).fetchall()
+    if not rows:
+        rows = conn.execute("SELECT board_id FROM boards WHERE LOWER(board_name) = LOWER(?)", (board_name,)).fetchall()
+    if not rows:
+        raise SystemExit(f"Board with name '{board_name}' not found.")
+    if len(rows) != 1:
+        raise SystemExit(f"Board name '{board_name}' is ambiguous. Rename duplicate boards in InvokeAI first.")
+    return rows[0][0]
 
 
 def get_images_for_board(conn: sqlite3.Connection, board_id: str) -> List[str]:
@@ -248,7 +247,8 @@ def main():
     print(f"Using database: {database_path}")
     print(f"Using images  : {outputs_path}")
     # mode=rw prevents SQLite from creating a new database if the file disappears.
-    conn = sqlite3.connect(database_path.as_uri() + "?mode=rw", uri=True)
+    mode = "ro" if args.dry_run else "rw"
+    conn = sqlite3.connect(database_path.as_uri() + f"?mode={mode}", uri=True)
 
     try:
         board_id = get_board_id_by_name(conn, args.board_name)

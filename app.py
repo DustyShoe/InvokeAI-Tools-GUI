@@ -7,11 +7,15 @@ import subprocess
 import sys
 import threading
 import tempfile
+import runpy
+import time
+import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 import yaml
+from version import VERSION
 
 REPO = Path(__file__).resolve().parent
 OPERATIONS = {
@@ -19,15 +23,116 @@ OPERATIONS = {
     'assets': ('Convert Board to Assets', 'scripts/Convert_Board_to_Assets_v1.1.py'),
     'board': ('Convert Assets to Board', 'scripts/Convert_Assets_to_Board_v1.1.py'),
     'png': ('Recompress PNG', 'scripts/png_recompress_level9_v1.0.py'),
+    'repair': ('Fix Image Deletion (#9504)', 'scripts/Repair_Image_Deletion.py'),
 }
 
+
+
+OPERATION_HELP = {
+    'repair': (
+        "Repair the database issue that prevents deleting images after a folder "
+        "migration (InvokeAI #9504). Adds cascading deletion to the move journal.\n\n"
+        "Stop InvokeAI before applying. A database backup is created automatically. "
+        "Images, files and completed move records are preserved. Unfinished migrations "
+        "or database integrity errors block the repair.\n\n"
+        "Dry run checks whether the repair is needed without writing changes. "
+        "Already repaired databases are left unchanged. Stop rolls back pending "
+        "schema changes; a final commit already in progress is allowed to finish."
+    ),
+    'restore': (
+        "Register missing PNG, JPEG and WebP images and recover embedded metadata. "
+        "Scans subfolders and ignores thumbnails.\n\n"
+        "Source folder is optional: files inside outputs/images stay in place; "
+        "external files are copied and verified, leaving originals untouched. "
+        "Conflicting files are skipped.\n\n"
+        "Import board applies to newly registered images only. Leave it blank for "
+        "automatic daily boards. Existing images keep their board assignments.\n\n"
+        "Dry run previews changes. Stop rolls back database changes; completed "
+        "copies remain available for the next run."
+    ),
+    'assets': (
+        "Reclassify images on the selected board as user assets. "
+        "They become available in InvokeAI's asset views.\n\n"
+        "Board membership, metadata and image files stay unchanged. "
+        "Images whose files cannot be found are skipped.\n\n"
+        "Dry run lists planned changes. Stop rolls back the pending database "
+        "transaction; a final commit already in progress is allowed to finish."
+    ),
+    'board': (
+        "Reclassify images on the selected board as regular gallery images.\n\n"
+        "Images remain on the same board; files are not moved or copied. "
+        "Metadata is preserved. Images whose files cannot be found are skipped.\n\n"
+        "Dry run lists planned changes. Stop rolls back the pending database "
+        "transaction; a final commit already in progress is allowed to finish."
+    ),
+    'png': (
+        "Recompress PNG files in the configured outputs/images folder, including "
+        "subfolders, to reduce disk usage without changing pixels. "
+        "Uses Pillow compression level 9 and preserves supported InvokeAI metadata.\n\n"
+        "Original files are replaced only when the result is smaller. "
+        "JPEG and WebP files are not processed.\n\n"
+        "Dry run performs the calculation without replacing files. Stop finishes "
+        "the current file safely; earlier completed files remain recompressed."
+    ),
+}
+
+
+class HoverHelp:
+    """Delayed tooltip, with no additional GUI dependency."""
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.pending = None
+        self.window = None
+        widget.bind('<Enter>', self.schedule, add=True)
+        widget.bind('<Leave>', self.hide, add=True)
+        widget.bind('<ButtonPress>', self.hide, add=True)
+        widget.bind('<Destroy>', self.hide, add=True)
+
+    def schedule(self, event=None):
+        self.hide()
+        self.pending = self.widget.after(550, self.show)
+
+    def show(self):
+        self.pending = None
+        if not self.widget.winfo_exists():
+            return
+        window = tk.Toplevel(self.widget)
+        self.window = window
+        window.withdraw()
+        window.overrideredirect(True)
+        window.attributes('-topmost', True)
+        tk.Label(window, text=self.text, justify='left', anchor='w',
+                 wraplength=410, font=('Segoe UI', 11), bg='#252c34',
+                 fg='#e3e8ef', padx=14, pady=12, relief='solid', bd=1).pack()
+        window.update_idletasks()
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        x = max(0, min(x, window.winfo_screenwidth() - window.winfo_reqwidth() - 8))
+        if y + window.winfo_reqheight() > window.winfo_screenheight():
+            y = max(0, self.widget.winfo_rooty() - window.winfo_reqheight() - 8)
+        window.geometry(f'+{x}+{y}')
+        window.deiconify()
+
+    def hide(self, event=None):
+        if self.pending is not None:
+            self.widget.after_cancel(self.pending)
+            self.pending = None
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
 
 def configured_paths(root):
     file = root / 'invokeai.yaml'
     config = (yaml.safe_load(file.read_text(encoding='utf-8-sig')) or {}) if file.is_file() else {}
     if not isinstance(config, dict):
         raise ValueError('Invalid invokeai.yaml: expected a mapping')
-    legacy = (config.get('InvokeAI') or {}).get('Paths') or {}
+    invokeai = config.get('InvokeAI') or {}
+    if not isinstance(invokeai, dict):
+        raise ValueError('Invalid invokeai.yaml: InvokeAI must be a mapping')
+    legacy = invokeai.get('Paths') or {}
+    if not isinstance(legacy, dict):
+        raise ValueError('Invalid invokeai.yaml: InvokeAI.Paths must be a mapping')
 
     def directory(keys, default):
         value = next((mapping[key] for mapping in (legacy, config) for key in keys
@@ -43,13 +148,16 @@ def configured_paths(root):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title('InvokeAI Database Tools')
-        self.geometry('760x650')
-        self.minsize(680, 580)
+        self.title(f'InvokeAI Database Tools v{VERSION}')
+        self.geometry('760x790')
+        self.minsize(680, 720)
         self.configure(fg_color='#181c20')
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(4, weight=1)
         self.root_path = tk.StringVar()
+        self.source_path = tk.StringVar()
+        self.import_board = tk.StringVar()
+        self.restore_controls = []
         self.operation = tk.StringVar(value='restore')
         self.dry_run = tk.BooleanVar(value=True)
         self.events = queue.Queue()
@@ -59,8 +167,11 @@ class App(ctk.CTk):
         self.boards = []
         self.loaded_root = None
         self.controls = []
+        self.selected_boards = {'assets': None, 'board': None}
+        self.board_selection_root = None
         self.menus = {}
-        ctk.CTkLabel(self, text='InvokeAI Database Tools', font=('Segoe UI', 18, 'bold'), anchor='w').grid(row=0, column=0, sticky='ew', padx=24, pady=(20, 16))
+        self.operation_help = []
+        ctk.CTkLabel(self, text=f'InvokeAI Database Tools v{VERSION}', font=('Segoe UI', 18, 'bold'), anchor='w').grid(row=0, column=0, sticky='ew', padx=24, pady=(20, 16))
         paths = ctk.CTkFrame(self, fg_color='transparent')
         paths.grid(row=1, column=0, sticky='ew', padx=24)
         paths.grid_columnconfigure(0, weight=1)
@@ -80,10 +191,24 @@ class App(ctk.CTk):
             radio = ctk.CTkRadioButton(operations, text=label, variable=self.operation, value=key, command=self.update_controls)
             radio.grid(row=row, column=0, sticky='w', pady=8, padx=(0, 20))
             self.controls.append(radio)
+            self.operation_help.append(HoverHelp(radio, OPERATION_HELP[key]))
             if key in ('assets', 'board'):
-                menu = ctk.CTkOptionMenu(operations, values=['Select a board'], height=32)
+                menu = ctk.CTkOptionMenu(operations, values=['Select a board'], height=32,
+                                         command=lambda value, operation=key: self.select_board(operation, value))
                 menu.grid(row=row, column=1, sticky='ew')
                 self.menus[key] = menu
+        ctk.CTkLabel(operations, text='Source folder (optional)').grid(row=6, column=0, sticky='w')
+        source_frame = ctk.CTkFrame(operations, fg_color='transparent')
+        source_frame.grid(row=6, column=1, sticky='ew', pady=(8, 4))
+        source_frame.grid_columnconfigure(0, weight=1)
+        source_entry = ctk.CTkEntry(source_frame, textvariable=self.source_path, placeholder_text='Default: outputs/images')
+        source_entry.grid(row=0, column=0, sticky='ew')
+        source_browse = ctk.CTkButton(source_frame, text='Browse', width=70, command=self.browse_source)
+        source_browse.grid(row=0, column=1, padx=(6, 0))
+        ctk.CTkLabel(operations, text='Import board (optional)').grid(row=7, column=0, sticky='w')
+        board_entry = ctk.CTkEntry(operations, textvariable=self.import_board, placeholder_text='Default: automatic boards')
+        board_entry.grid(row=7, column=1, sticky='ew', pady=(4, 8))
+        self.restore_controls.extend([source_entry, source_browse, board_entry])
         actions = ctk.CTkFrame(self, fg_color='transparent')
         actions.grid(row=3, column=0, sticky='ew', padx=24, pady=(14, 12))
         actions.grid_columnconfigure(0, weight=1)
@@ -106,7 +231,7 @@ class App(ctk.CTk):
         self.progress = ctk.CTkProgressBar(footer, height=8)
         self.progress.grid(row=1, column=0, sticky='ew', pady=(4, 0))
         self.progress.set(0)
-        self.append_log('[INFO] InvokeAI Database Tools initialized.\n[INFO] Choose the InvokeAI root directory.')
+        self.append_log(f'[INFO] InvokeAI Database Tools v{VERSION} initialized.\n[INFO] Choose the InvokeAI root directory.')
         self.update_controls()
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.after(80, self.poll)
@@ -122,6 +247,11 @@ class App(ctk.CTk):
         self.log.delete('1.0', 'end')
         self.log.configure(state='disabled')
 
+    def browse_source(self):
+        path = filedialog.askdirectory(title='Select image batch folder')
+        if path:
+            self.source_path.set(path)
+
     def browse(self):
         path = filedialog.askdirectory(title='Select InvokeAI root directory')
         if path:
@@ -132,7 +262,11 @@ class App(ctk.CTk):
         if self.running:
             return
         value = self.root_path.get().strip()
-        root = Path(value).expanduser().resolve() if value else None
+        try:
+            root = Path(value).expanduser().resolve() if value else None
+        except (OSError, ValueError) as exc:
+            self.append_log(f'[ERROR] Invalid root directory: {exc}')
+            root = None
         if root == self.loaded_root:
             return
         self.boards = []
@@ -146,18 +280,40 @@ class App(ctk.CTk):
                 self.append_log(f'[INFO] Loaded {len(self.boards)} boards from {database}')
             except Exception as exc:
                 self.append_log(f'[ERROR] Unable to load boards: {exc}')
-        for menu in self.menus.values():
-            previous = menu.get()
+        if root != self.board_selection_root:
+            self.selected_boards = {'assets': None, 'board': None}
+        self.board_selection_root = root
+        for key, menu in self.menus.items():
+            selected = self.selected_boards[key]
+            if selected not in self.boards:
+                selected = None
+                self.selected_boards[key] = None
             menu.configure(values=self.boards or ['No boards available'])
-            menu.set(previous if previous in self.boards else self.boards[0] if self.boards else 'No boards available')
+            menu.set(selected if selected is not None else 'Select a board')
+        self.update_controls()
+
+    def select_board(self, operation, value):
+        self.selected_boards[operation] = value if value in self.boards else None
         self.update_controls()
 
     def update_controls(self):
         for control in self.controls:
             control.configure(state='disabled' if self.running else 'normal')
+        for control in self.restore_controls:
+            control.configure(state='normal' if not self.running and self.operation.get() == 'restore' else 'disabled')
         for key, menu in self.menus.items():
-            menu.configure(state='normal' if not self.running and self.operation.get() == key and self.boards else 'disabled')
-        self.run_button.configure(state='disabled' if self.running else 'normal')
+            enabled = not self.running and self.operation.get() == key and bool(self.boards)
+            menu.configure(
+                state='normal' if enabled else 'disabled',
+                fg_color='#1f6aa5' if enabled else '#303438',
+                button_color='#144870' if enabled else '#303438',
+                button_hover_color='#36719f' if enabled else '#303438',
+                text_color_disabled='#858b92',
+            )
+        operation = self.operation.get()
+        needs_board = operation in self.menus
+        can_run = not self.running and (not needs_board or self.selected_boards[operation] in self.boards)
+        self.run_button.configure(state='normal' if can_run else 'disabled')
         self.stop_button.configure(state='normal' if self.running and not self.stop_pending else 'disabled')
 
     def run(self):
@@ -176,20 +332,29 @@ class App(ctk.CTk):
             script = REPO / OPERATIONS[key][1]
             if not script.is_file():
                 raise ValueError(f'Script not found: {script}')
-            if not images.is_dir():
+            if key != 'repair' and not images.is_dir():
                 raise ValueError(f'Images directory not found: {images}')
-            args = [sys.executable, '-u', str(script)]
+            args = ([sys.executable] if getattr(sys, 'frozen', False) else [sys.executable, '-u', str(Path(__file__).resolve())]) + ['--run-operation', key]
             if key == 'png':
                 args += [str(images), '--verbose']
             else:
                 if not database.is_file():
                     raise ValueError(f'Database not found: {database}')
-                if key == 'restore':
+                if key == 'repair':
+                    args += ['--db-path', str(database)]
+                elif key == 'restore':
                     args += ['--db-path', str(database), '--outputs-path', str(images)]
+                    if self.source_path.get().strip():
+                        args += ['--source-path', self.source_path.get().strip()]
+                    if self.import_board.get().strip():
+                        args += ['--board-name', self.import_board.get().strip()]
                 else:
                     if not self.boards or self.loaded_root != root:
                         raise ValueError('Select a root with a readable database and a board.')
-                    args += ['--board-name', self.menus[key].get(), '--verbose']
+                    selected_board = self.selected_boards[key]
+                    if selected_board is None or selected_board not in self.boards:
+                        raise ValueError('Select a board before running the conversion.')
+                    args += ['--board-name', selected_board, '--verbose']
             if self.dry_run.get():
                 args.append('--dry-run')
             elif not messagebox.askokcancel('Apply changes', 'Stop InvokeAI before continuing.\nBack up your database and images.\n\nApply this operation now?', parent=self):
@@ -227,10 +392,27 @@ class App(ctk.CTk):
             environment = os.environ.copy()
             environment['PYTHONIOENCODING'] = 'utf-8'
             environment['INVOKEAI_TOOLS_STOP_FILE'] = str(self.stop_file)
-            with subprocess.Popen(args, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', env=environment, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)) as process:
-                for line in process.stdout:
-                    self.events.put(('log', line))
-                code = process.wait()
+            log_path = self.stop_file.parent / 'worker.log'
+            log_path.touch()
+            # Explicit file logging also works in a windowed EXE with no stdout handles.
+            command = args[:]
+            position = command.index('--run-operation') + 2
+            command[position:position] = ['--worker-log', str(log_path)]
+            with log_path.open('r', encoding='utf-8', errors='replace') as output:
+                with subprocess.Popen(command, cwd=root, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, env=environment,
+                                      creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)) as process:
+                    while True:
+                        chunk = output.read()
+                        if chunk:
+                            self.events.put(('log', chunk))
+                        if process.poll() is not None:
+                            remainder = output.read()
+                            if remainder:
+                                self.events.put(('log', remainder))
+                            code = process.returncode
+                            break
+                        time.sleep(0.05)
             self.events.put(('done', code))
         except Exception as exc:
             self.events.put(('log', f'[ERROR] {exc}'))
@@ -266,9 +448,47 @@ class App(ctk.CTk):
         self.destroy()
 
 
+def run_embedded_operation(arguments):
+    key = arguments[0] if arguments else ''
+    if key not in OPERATIONS:
+        return 2
+    remaining = arguments[1:]
+    if len(remaining) < 2 or remaining[0] != '--worker-log':
+        return 2
+    log_path = remaining[1]
+    with open(log_path, 'w', encoding='utf-8', buffering=1) as output:
+        sys.stdout = output
+        sys.stderr = output
+        try:
+            script = REPO / OPERATIONS[key][1]
+            sys.argv = [str(script), *remaining[2:]]
+            runpy.run_path(str(script), run_name='__main__')
+            return 0
+        except SystemExit as exc:
+            if exc.code is None:
+                return 0
+            if isinstance(exc.code, int):
+                return exc.code
+            print(exc.code)
+            return 1
+        except BaseException:
+            traceback.print_exc()
+            return 1
+        finally:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+
+
 if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == '--run-operation':
+        raise SystemExit(run_embedded_operation(sys.argv[2:]))
     ctk.set_appearance_mode('dark')
     ctk.set_default_color_theme('blue')
-    App().mainloop()
+    app = App()
+    if '--check-gui' in sys.argv[1:]:
+        app.update()
+        app.destroy()
+    else:
+        app.mainloop()
 
 
