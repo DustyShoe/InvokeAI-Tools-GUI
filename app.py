@@ -11,6 +11,7 @@ import tempfile
 import runpy
 import time
 import traceback
+import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -19,6 +20,7 @@ import yaml
 from version import VERSION
 
 REPO = Path(__file__).resolve().parent
+GITHUB_URL = 'https://github.com/DustyShoe/InvokeAI-Tools-GUI'
 OPERATIONS = {
     'restore': ('Restore Images Database', 'scripts/Restore_Images_DB_v3.1.py'),
     'assets': ('Convert Board to Assets', 'scripts/Convert_Board_to_Assets_v1.1.py'),
@@ -225,7 +227,16 @@ class App(ctk.CTk):
         self.board_selection_root = None
         self.menus = {}
         self.operation_help = []
-        ctk.CTkLabel(self, text=f'InvokeAI Database Tools v{VERSION}', font=('Segoe UI', 18, 'bold'), anchor='w').grid(row=0, column=0, sticky='ew', padx=24, pady=(20, 16))
+        self.about_window = None
+        header = ctk.CTkFrame(self, fg_color='transparent')
+        header.grid(row=0, column=0, sticky='ew', padx=24, pady=(20, 16))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(header, text=f'InvokeAI Database Tools v{VERSION}',
+                     font=('Segoe UI', 18, 'bold'), anchor='w').grid(row=0, column=0, sticky='ew')
+        self.about_button = ctk.CTkButton(header, text='?', width=32, height=32,
+                                         font=('Segoe UI', 18, 'bold'), fg_color='#30363e',
+                                         hover_color='#414b57', command=self.show_about)
+        self.about_button.grid(row=0, column=1, padx=(12, 0))
         paths = ctk.CTkFrame(self, fg_color='transparent')
         paths.grid(row=1, column=0, sticky='ew', padx=24)
         paths.grid_columnconfigure(0, weight=1)
@@ -296,6 +307,37 @@ class App(ctk.CTk):
         self.update_controls()
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.after(80, self.poll)
+
+    def show_about(self):
+        if self.about_window is not None and self.about_window.winfo_exists():
+            self.about_window.lift()
+            self.about_window.focus_set()
+            return
+        window = tk.Toplevel(self, bg='#181c20')
+        self.about_window = window
+        window.withdraw()
+        window.title('About')
+        window.transient(self)
+        window.resizable(False, False)
+        ctk.CTkLabel(window, text=f'InvokeAI Database Tools v{VERSION}',
+                     font=('Segoe UI', 18, 'bold')).pack(padx=24, pady=(24, 8))
+        ctk.CTkLabel(window, text='Database maintenance and PNG recompression.').pack(padx=24, pady=(0, 16))
+        ctk.CTkButton(window, text='GitHub: DustyShoe/InvokeAI-Tools-GUI',
+                      command=self.open_github, cursor='hand2').pack(padx=24, pady=(0, 24))
+        window.bind('<Escape>', lambda event: window.destroy())
+        window.update_idletasks()
+        width, height = max(420, window.winfo_reqwidth()), max(190, window.winfo_reqheight())
+        left, top, right, bottom = monitor_work_area(self)
+        x = self.winfo_rootx() + (self.winfo_width() - width) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - height) // 2
+        x = max(left + 8, min(x, right - width - 8))
+        y = max(top + 8, min(y, bottom - height - 8))
+        window.geometry(f'{width}x{height}+{x}+{y}')
+        window.deiconify()
+        window.focus_set()
+
+    def open_github(self):
+        webbrowser.open(GITHUB_URL, new=2)
 
     def append_log(self, text):
         self.log.configure(state='normal')

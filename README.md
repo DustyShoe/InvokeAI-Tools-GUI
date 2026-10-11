@@ -1,10 +1,10 @@
-# InvokeAI Tools GUI v1.1
+# InvokeAI Database Tools v1.1
 
 A desktop application for InvokeAI database maintenance and PNG recompression.
 It brings the scripts from [InvokeAI-Tools](https://github.com/DustyShoe/InvokeAI-Tools)
 together in a convenient graphical interface.
 
-![InvokeAI Tools GUI v1.1 screenshot](docs/images/invokeai-tools-gui-v1.1.png)
+![InvokeAI Database Tools v1.1 screenshot](docs/images/invokeai-tools-gui-v1.1.png)
 
 ## Getting started
 
