@@ -54,6 +54,12 @@ class UnsupportedPngError(ValueError):
 
 
 
+def report_progress(processed: int, total: int) -> None:
+    """Send machine-readable progress only when launched by the GUI."""
+    if os.environ.get("INVOKEAI_TOOLS_PROGRESS") == "1":
+        print(f"[PROGRESS] {processed} {total}", flush=True)
+
+
 def cancellation_checkpoint() -> None:
     marker = os.environ.get("INVOKEAI_TOOLS_STOP_FILE")
     if marker and Path(marker).is_file():
@@ -374,6 +380,7 @@ def main() -> int:
         return 1
 
     png_files = list(iter_png_files(target_path, recursive=recursive))
+    report_progress(0, len(png_files))
     if not png_files:
         print("No PNG files found.")
         return 1
@@ -388,7 +395,7 @@ def main() -> int:
         "saved_bytes": 0,
     }
 
-    for png_path in png_files:
+    for processed, png_path in enumerate(png_files, 1):
         cancellation_checkpoint()
         try:
             result = process_file(
@@ -413,6 +420,7 @@ def main() -> int:
 
         if args.verbose or result.status not in {"unchanged"}:
             print_result(png_path, result)
+        report_progress(processed, len(png_files))
 
     cancellation_checkpoint()
     print(

@@ -122,6 +122,18 @@ class ImportTests(unittest.TestCase):
                 self.module.copy_verified(source,self.images/source.name)
         self.assertEqual(list(self.images.iterdir()),[])
 
+    def test_single_board_summary_combines_metadata_groups(self):
+        self.external('without-metadata.png')
+        from PIL import PngImagePlugin
+        info = PngImagePlugin.PngInfo()
+        info.add_text('invokeai_metadata', '{}')
+        Image.new('RGB', (5, 5)).save(self.source / 'with-metadata.png', pnginfo=info)
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.run_batch(), 0)
+        added = [line.strip() for line in output.getvalue().splitlines()
+                 if line.strip().startswith('Added to')]
+        self.assertEqual(added, ['Added to Batch A: 2'])
+
 
 if __name__=='__main__':
     unittest.main()

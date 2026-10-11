@@ -1,4 +1,4 @@
-# InvokeAI Tools GUI v1.0
+# InvokeAI Tools GUI v1.1
 
 A desktop application for InvokeAI database maintenance and PNG recompression.
 It brings the scripts from [InvokeAI-Tools](https://github.com/DustyShoe/InvokeAI-Tools)
@@ -11,7 +11,9 @@ Open the application and select your InvokeAI root directory, containing
 operation for a detailed explanation.
 
 **Dry run** is enabled by default: it previews changes without applying them.
-The log shows progress, results, skipped files, and errors.
+Restore and Recompress show the number of processed files and a progress bar.
+The log shows results, skipped files, and errors. Right-click to copy selected
+text or the entire log.
 
 Stop InvokeAI before applying changes. Keep a backup of your database and images.
 Restore and Fix Image Deletion create database backups automatically; the board
@@ -20,7 +22,8 @@ conversion operations do not.
 ## Operations
 
 - **Restore Images Database** — register missing images and recover embedded
-  metadata. Existing records retain their board membership.
+  metadata and create missing WebP thumbnails. Existing records retain their
+  board membership.
 - **Convert Board to Assets** — reclassify images on the selected board as user
   assets, preserving their files, metadata, and board membership.
 - **Convert Assets to Board** — reclassify images on the selected board as regular

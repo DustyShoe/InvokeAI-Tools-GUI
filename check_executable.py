@@ -49,6 +49,9 @@ def check(executable):
         operation('restore', args + ['--dry-run'])
         assert db.read_bytes() == original
         operation('restore', args)
+        with Image.open(images.parent / 'thumbnails/general/sample.webp') as preview:
+            assert preview.format == 'WEBP'
+            assert max(preview.size) <= 256
         with closing(sqlite3.connect(db)) as c:
             assert c.execute('SELECT image_subfolder FROM images').fetchone()[0] == 'general'
             board = c.execute('SELECT board_name FROM boards').fetchone()[0]
@@ -100,6 +103,9 @@ def check(executable):
         assert not (images.parent / source_image.name).exists()
         operation('restore', batch_args)
         assert (images.parent / source_image.name).read_bytes() == source_image.read_bytes()
+        with Image.open(images.parent / 'thumbnails/batch-image.webp') as preview:
+            assert preview.format == 'WEBP'
+            preview.verify()
         with closing(sqlite3.connect(db)) as c:
             assert c.execute("SELECT b.board_name FROM boards b JOIN board_images bi USING(board_id) WHERE bi.image_name='batch-image.png'").fetchone()[0] == 'Imported batch'
         from test_cancellation import load

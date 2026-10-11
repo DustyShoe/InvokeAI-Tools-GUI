@@ -51,6 +51,12 @@ import yaml
 
 
 
+def report_progress(processed: int, total: int) -> None:
+    """Send machine-readable progress only when launched by the GUI."""
+    if os.environ.get("INVOKEAI_TOOLS_PROGRESS") == "1":
+        print(f"[PROGRESS] {processed} {total}", flush=True)
+
+
 def stop_requested() -> bool:
     """Cooperative GUI cancellation; never interrupt a write in progress."""
     marker = os.environ.get("INVOKEAI_TOOLS_STOP_FILE")
@@ -492,6 +498,46 @@ def copy_verified(source: Path, target: Path) -> bool:
         temporary_path.unlink(missing_ok=True)
 
 
+def ensure_thumbnail(source: Path, outputs_path: Path, image_subfolder: str, dry_run: bool = False) -> bool:
+    """Create a missing InvokeAI-compatible WebP thumbnail without replacing files."""
+    root = outputs_path.resolve()
+    thumbnail_root = root / "thumbnails"
+    target = thumbnail_root / image_subfolder / source.with_suffix(".webp").name
+    if not thumbnail_root.resolve().is_relative_to(root) or not target.resolve().is_relative_to(thumbnail_root.resolve()):
+        raise ValueError(f"Unsafe thumbnail destination: {target}")
+    if target.is_file():
+        return False
+    if target.exists():
+        raise OSError(f"Thumbnail destination is not a file: {target}")
+    print(f"{'[DRY] Would create' if dry_run else '[INFO] Creating'} thumbnail: {target}")
+    if dry_run:
+        return True
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".thumbnail-", suffix=".tmp", dir=target.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            with PIL.Image.open(source) as image:
+                # Match InvokeAI's 256-pixel, aspect-preserving WebP previews.
+                has_alpha = "A" in image.getbands() or "transparency" in image.info
+                with image.convert("RGBA" if has_alpha else "RGB") as thumbnail:
+                    thumbnail.thumbnail((256, 256))
+                    thumbnail.save(stream, format="WEBP")
+            stream.flush()
+            os.fsync(stream.fileno())
+        with PIL.Image.open(temporary_path) as check:
+            check.verify()
+        try:
+            os.link(temporary_path, target)
+        except FileExistsError:
+            if not target.is_file():
+                raise
+            return False
+        return True
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def import_strategy(root: Path) -> str:
     config_file = root / "invokeai.yaml"
     config = yaml.safe_load(config_file.read_text(encoding="utf-8-sig")) if config_file.is_file() else {}
@@ -626,6 +672,7 @@ def main() -> int:
         "updated": 0,
         "paths_updated": 0,
         "copied": 0,
+        "thumbnails_created": 0,
         "conflicts": 0,
         "skipped_has_metadata": 0,
         "skipped_no_metadata": 0,
@@ -639,6 +686,7 @@ def main() -> int:
     board_ids: dict[str, str] = {}
     created_boards: list[str] = []
 
+    report_progress(0, len(image_paths))
     connection.execute("BEGIN")
     for image_path in image_paths:
         cancellation_checkpoint(connection)
@@ -648,6 +696,7 @@ def main() -> int:
         stats_before = stats.copy()
         created_before = len(created_boards)
         cursor.execute("SAVEPOINT import_image")
+        completed = False
         try:
             if external_source:
                 candidates = destination_files.get(image_name, [])
@@ -655,6 +704,7 @@ def main() -> int:
                     stats["conflicts"] += 1
                     print(f"[CONFLICT] Skipped {source_image}: destination name has different or ambiguous contents")
                     cursor.execute("RELEASE import_image")
+                    completed = True
                     continue
                 if candidates:
                     if not candidates[0].resolve().is_relative_to(outputs_path):
@@ -680,6 +730,10 @@ def main() -> int:
             image_subfolder = "" if relative_parent == Path(".") else relative_parent.as_posix()
             if image_subfolder and not has_subfolder_column:
                 raise ValueError("This database has no image_subfolder column; nested images cannot be registered safely.")
+            thumbnail_source = source_image if args.dry_run else image_path
+            if ensure_thumbnail(thumbnail_source, outputs_path, image_subfolder, args.dry_run):
+                stats["thumbnails_created"] += 1
+            cancellation_checkpoint(connection)
             # Paths must be repaired even for records whose metadata is already present.
             if has_subfolder_column and image_name in existing_metadata:
                 if existing_subfolders.get(image_name, "") != image_subfolder:
@@ -692,6 +746,7 @@ def main() -> int:
             if metadata_value is not None and not is_metadata_missing(metadata_value):
                 stats["skipped_has_metadata"] += 1
                 cursor.execute("RELEASE import_image")
+                completed = True
                 continue
 
             metadata_json, has_workflow, width, height = read_image_metadata(source_image)
@@ -700,6 +755,7 @@ def main() -> int:
             if metadata_json is None and image_name in existing_metadata:
                 stats["skipped_no_metadata"] += 1
                 cursor.execute("RELEASE import_image")
+                completed = True
                 continue
 
             if image_name in existing_metadata:
@@ -774,16 +830,25 @@ def main() -> int:
                 existing_metadata[image_name] = metadata_json
 
             cursor.execute("RELEASE import_image")
+            completed = True
         except Exception as exc:
             cursor.execute("ROLLBACK TO import_image")
             cursor.execute("RELEASE import_image")
             board_ids.clear()
             del created_boards[created_before:]
             copied = stats["copied"]
+            thumbnails_created = stats["thumbnails_created"]
             stats = stats_before
-            stats["copied"] = copied  # Completed copies survive the per-image rollback.
+            # Completed filesystem writes survive the per-image database rollback.
+            stats["copied"] = copied
+            stats["thumbnails_created"] = thumbnails_created
             stats["errors"] += 1
             print(f"Error processing {source_image}: {exc}")
+            completed = True
+        finally:
+            # Handled errors and skips count; interrupted files do not.
+            if completed:
+                report_progress(stats["processed"], len(image_paths))
 
     cancellation_checkpoint(connection)
     if not args.dry_run:
@@ -796,12 +861,17 @@ def main() -> int:
     print(f"  Metadata updated     : {stats['updated']}")
     print(f"  Image paths updated  : {stats['paths_updated']}")
     print(f"  Files copied/planned : {stats['copied']}")
+    print(f"  Thumbnails made/planned: {stats['thumbnails_created']}")
     print(f"  Conflicts skipped    : {stats['conflicts']}")
     print(f"  Skipped (already in DB with metadata): {stats['skipped_has_metadata']}")
     print(f"  Skipped (already in DB; no metadata found in file): {stats['skipped_no_metadata']}")
     print(f"  Errors               : {stats['errors']}")
-    print(f"  Added to {import_board_name}: {stats['added_to_import_board']}")
-    print(f"  Added to {no_metadata_board_name}: {stats['added_to_no_metadata_board']}")
+    if import_board_name == no_metadata_board_name:
+        added = stats["added_to_import_board"] + stats["added_to_no_metadata_board"]
+        print(f"  Added to {import_board_name}: {added}")
+    else:
+        print(f"  Added to {import_board_name}: {stats['added_to_import_board']}")
+        print(f"  Added to {no_metadata_board_name}: {stats['added_to_no_metadata_board']}")
     for board_name in created_boards:
         print(f"  Created board         : {board_name}")
 
